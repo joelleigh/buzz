@@ -240,4 +240,119 @@ mod postgres_tests {
             assert_eq!(users(&state, community).await, before);
         }
     }
+
+    /// A claim that records the agent's owner makes its ordinary rows show
+    /// `bot`, so the rosters of channels it is already in must be republished,
+    /// as on first AUTH. No membership change happens in those channels.
+    ///
+    /// Mutation: remove the republish from `owner_recorded_by_claim`, or call
+    /// that helper from only one claim format → that format's rosters keep
+    /// `member` → RED.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn owner_recorded_by_v1_and_v2_claims_republishes_the_agents_rosters() {
+        use buzz_core::channel::{ChannelType, ChannelVisibility, MemberRole};
+
+        let (state, host, community, issuer) = fixture().await;
+        let v2 = mint_code(
+            state.clone(),
+            &host,
+            &issuer,
+            serde_json::json!({"max_uses":1}),
+        )
+        .await;
+        let key = derive_invite_key(&state.relay_keypair);
+        let (v1, _) = crate::invite_token::mint_invite(&key, community, 3600);
+        for code in [v1, v2] {
+            let (owner, agent) = (Keys::generate(), Keys::generate());
+            let agent_bytes = agent.public_key().to_bytes();
+            state
+                .db
+                .ensure_user(community, &agent_bytes)
+                .await
+                .expect("seed agent user");
+            let mut channels = Vec::new();
+            for name in ["claim-roster-a", "claim-roster-b"] {
+                let channel = state
+                    .db
+                    .create_channel(
+                        community,
+                        name,
+                        ChannelType::Stream,
+                        ChannelVisibility::Open,
+                        None,
+                        &issuer.public_key().to_bytes(),
+                        None,
+                    )
+                    .await
+                    .expect("create channel")
+                    .id;
+                state
+                    .db
+                    .add_member(
+                        community,
+                        channel,
+                        &agent_bytes,
+                        MemberRole::Member,
+                        Some(&issuer.public_key().to_bytes()),
+                    )
+                    .await
+                    .expect("add unowned agent");
+                channels.push(channel);
+            }
+
+            let tag = buzz_sdk::nip_oa::compute_auth_tag(&owner, &agent.public_key(), "").unwrap();
+            let response = post_with_owner_tag(
+                state.clone(),
+                &host,
+                "/api/invites/claim",
+                &agent,
+                serde_json::json!({"code":code}).to_string(),
+                &tag,
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(state
+                .db
+                .is_agent_owner(
+                    community,
+                    agent.public_key().as_bytes(),
+                    owner.public_key().as_bytes()
+                )
+                .await
+                .unwrap());
+
+            let agent_hex = agent.public_key().to_hex();
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            for channel in channels {
+                loop {
+                    let live: Option<serde_json::Value> = sqlx::query_scalar(
+                        "SELECT tags FROM events WHERE community_id = $1 AND channel_id = $2 \
+                         AND kind = 39002 AND deleted_at IS NULL",
+                    )
+                    .bind(community.as_uuid())
+                    .bind(channel)
+                    .fetch_optional(state.db.pool())
+                    .await
+                    .expect("read live roster");
+                    let shows_bot =
+                        live.as_ref()
+                            .and_then(|tags| tags.as_array())
+                            .is_some_and(|tags| {
+                                tags.iter().any(|tag| {
+                                    tag[0] == "p" && tag[1] == agent_hex.as_str() && tag[3] == "bot"
+                                })
+                            });
+                    if shows_bot {
+                        break;
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "code {code}: the roster must show the claimant as bot: {live:?}"
+                    );
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            }
+        }
+    }
 }

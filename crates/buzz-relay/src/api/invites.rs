@@ -413,6 +413,23 @@ async fn mint_invite_inner(
     })))
 }
 
+/// A claim just recorded the claimant's agent owner, after its transaction
+/// committed. Do what first AUTH does when it records an owner: make sockets
+/// opened without the owner reconnect with it, and republish the claimant's
+/// rosters in the background, because rosters show `bot` for an owned agent.
+fn owner_recorded_by_claim(
+    state: &Arc<AppState>,
+    tenant: &buzz_core::TenantContext,
+    claimant: &nostr::PublicKey,
+) {
+    state.disconnect_unowned_agent_clusterwide(tenant, claimant.as_bytes());
+    crate::handlers::side_effects::spawn_agent_roster_republish(
+        tenant,
+        Arc::clone(state),
+        claimant.to_bytes().to_vec(),
+    );
+}
+
 /// Claim an invite code — `POST /api/invites/claim`, NIP-98 signed by the
 /// *joining* pubkey. Exempt from the relay-membership gate by design.
 ///
@@ -480,7 +497,7 @@ pub async fn claim_invite(
         metrics::counter!("buzz_users_created_total", "community" => tenant.host().to_owned())
             .increment(write.outcome.users_created);
         if write.outcome.owner_link_created {
-            state.disconnect_unowned_agent_clusterwide(&tenant, pubkey.as_bytes());
+            owner_recorded_by_claim(&state, &tenant, &pubkey);
         }
         fan_out_nip43_membership_list(&tenant, &state, write.snapshot).await;
         return match write.outcome.outcome {
@@ -575,7 +592,7 @@ pub async fn claim_invite(
     metrics::counter!("buzz_users_created_total", "community" => tenant.host().to_owned())
         .increment(write.outcome.users_created);
     if write.outcome.owner_link_created {
-        state.disconnect_unowned_agent_clusterwide(&tenant, pubkey.as_bytes());
+        owner_recorded_by_claim(&state, &tenant, &pubkey);
     }
     let was_inserted = write.outcome.inserted;
     fan_out_nip43_membership_list(&tenant, &state, write.snapshot).await;
